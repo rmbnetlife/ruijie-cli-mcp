@@ -174,6 +174,89 @@ class TelnetSessionManager:
             pass
         return output
 
+    async def _handle_login_auth(
+        self,
+        writer: telnetlib3.TelnetWriter,
+        reader: telnetlib3.TelnetReader,
+        username: str = "admin",
+        password: str = "admin",
+        timeout: float = 5.0,
+    ) -> bool:
+        """
+        处理 Telnet 登录认证（用户名/密码提示）
+
+        锐捷设备可能配置为需要用户名和密码认证：
+        - 显示 "Username:" 提示
+        - 显示 "Password:" 提示
+        - 密码 weakness 警告后仍可登录
+
+        Args:
+            writer: Telnet 写入器
+            reader: Telnet 读取器
+            username: 用户名（默认 admin）
+            password: 密码（默认 admin）
+            timeout: 总超时时间（秒）
+
+        Returns:
+            是否认证成功
+        """
+        start_time = asyncio.get_event_loop().time()
+        output = ""
+        auth_state = "waiting_username"  # waiting_username -> sent_username -> sent_password -> done
+
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            try:
+                data = await asyncio.wait_for(reader.read(4096), timeout=0.5)
+                if data:
+                    output += data
+                    logger.debug(f"[auth] 读取到 {len(data)} 字节：{repr(data[:100])}")
+
+                    # 检测用户名提示
+                    if auth_state == "waiting_username" and "Username:" in output:
+                        logger.info("[auth] 检测到 Username 提示，发送用户名")
+                        writer.write(username + "\r\n")
+                        await writer.drain()
+                        auth_state = "sent_username"
+                        output = ""
+                        continue
+
+                    # 检测密码提示
+                    if auth_state in ["sent_username", "waiting_password"] and "Password:" in output:
+                        logger.info("[auth] 检测到 Password 提示，发送密码")
+                        writer.write(password + "\r\n")
+                        await writer.drain()
+                        auth_state = "sent_password"
+                        output = ""
+                        continue
+
+                    # 检测密码强度警告（可选，不影响登录）
+                    if auth_state == "sent_password" and "password is too weak" in output:
+                        logger.warning("[auth] 密码强度警告，继续登录流程")
+                        output = ""
+                        continue
+
+                    # 检测登录成功（出现设备提示符）
+                    if auth_state == "sent_password":
+                        clean = output.replace('\x08', '').replace(' \b', '')
+                        if re.search(r'[\r\n][A-Za-z0-9_-]+[#>]\s*$', clean):
+                            logger.info("[auth] 认证成功")
+                            return True
+
+            except asyncio.TimeoutError:
+                # 超时检查
+                if auth_state == "sent_password":
+                    # 已发送密码，检查是否已登录
+                    clean = output.replace('\x08', '').replace(' \b', '')
+                    if re.search(r'[\r\n][A-Za-z0-9_-]+[#>]\s*$', clean):
+                        logger.info("[auth] 认证成功（超时前已登录）")
+                        return True
+
+        # 超时或无认证提示，返回当前状态
+        if auth_state == "waiting_username":
+            logger.info("[auth] 未检测到用户名提示，设备可能无需认证")
+            return True  # 无需认证也算成功
+        return False
+
     async def _send_with_retry(
         self,
         writer: telnetlib3.TelnetWriter,
@@ -222,7 +305,7 @@ class TelnetSessionManager:
         return False
 
     async def connect(
-        self, host: str, port: int, timeout: int = 5000
+        self, host: str, port: int, timeout: int = 5000, username: str = "admin", password: str = "admin"
     ) -> str:
         """
         建立 Telnet 连接
@@ -230,11 +313,12 @@ class TelnetSessionManager:
         连接流程（针对锐捷设备优化）:
         1. TCP 连接建立
         2. 终端激活（发送回车处理 "Press RETURN to get started"）
-        3. TCP 预热（发送 ? 产生大量输出以初始化通道）
-        4. 排空预热输出（含 syslog 消息）
-        5. 检测当前模式，若为用户模式(>)则自动 enable 进入特权模式(#)
-        6. 配置模式检测与退出（回到特权模式）
-        7. 禁用分页（terminal length 0，带重试，需特权模式）
+        3. 登录认证（处理 Username:/Password: 提示）
+        4. TCP 预热（发送 ? 产生大量输出以初始化通道）
+        5. 排空预热输出（含 syslog 消息）
+        6. 检测当前模式，若为用户模式(>)则自动 enable 进入特权模式(#)
+        7. 配置模式检测与退出（回到特权模式）
+        8. 禁用分页（terminal length 0，带重试，需特权模式）
         """
         timeout_seconds = timeout / 1000.0
 
@@ -264,7 +348,45 @@ class TelnetSessionManager:
                 await writer.drain()
                 await asyncio.sleep(0.3)
 
-            # Step 3: TCP 预热
+            # Step 3: 登录认证处理
+            # 锐捷设备可能配置为需要用户名/密码认证
+            # 先读取初始输出，检测是否有 "Username:" 提示
+            await asyncio.sleep(0.5)
+            auth_output = await self._drain_output(reader, timeout=1.0)
+            logger.debug(f"[connect] 认证前输出：{repr(auth_output[:200]) if auth_output else 'empty'}")
+
+            # 检测是否需要认证
+            if "Username:" in auth_output or "username:" in auth_output:
+                logger.info("[connect] 检测到用户名提示，开始登录认证")
+                # 发送用户名
+                writer.write("admin\r\n")
+                await writer.drain()
+                await asyncio.sleep(0.5)
+                
+                # 读取密码提示
+                password_output = await self._drain_output(reader, timeout=1.0)
+                logger.debug(f"[connect] 密码提示输出：{repr(password_output[:200]) if password_output else 'empty'}")
+                
+                if "Password:" in password_output or "password:" in password_output:
+                    # 发送密码
+                    writer.write("admin\r\n")
+                    await writer.drain()
+                    await asyncio.sleep(1.0)
+                    
+                    # 读取认证结果
+                    auth_result = await self._drain_output(reader, timeout=1.0)
+                    logger.debug(f"[connect] 认证结果：{repr(auth_result[:300]) if auth_result else 'empty'}")
+                    
+                    # 检测密码强度警告（可选）
+                    if "password is too weak" in auth_result:
+                        logger.warning("[connect] 密码强度警告，继续登录流程")
+                        # 继续读取登录成功后的输出
+                        await asyncio.sleep(0.5)
+                        auth_result = await self._drain_output(reader, timeout=1.0)
+            else:
+                logger.info("[connect] 未检测到用户名提示，设备可能无需认证")
+
+            # Step 4: TCP 预热
             # 发送 ? 命令产生大量输出，确保 TCP 通道完全建立
             for i in range(5):
                 writer.write("?\r\n")
@@ -724,7 +846,7 @@ session_manager = TelnetSessionManager()
 # ============================================================
 
 @mcp.tool()
-async def telnet_connect(host: str, port: int, timeout: int = 5000) -> str:
+async def telnet_connect(host: str, port: int, timeout: int = 5000, username: str = "admin", password: str = "admin") -> str:
     """
     建立 Telnet 连接
 
@@ -743,7 +865,7 @@ async def telnet_connect(host: str, port: int, timeout: int = 5000) -> str:
         - "R1(config-router)#" 表示路由配置模式
     """
     try:
-        session_id = await session_manager.connect(host, port, timeout)
+        session_id = await session_manager.connect(host, port, timeout, username, password)
         # 发送空命令获取当前提示符
         initial_output = await session_manager.execute(session_id, "", 1000)
         device_mode = detect_device_mode(initial_output)

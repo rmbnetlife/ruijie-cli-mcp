@@ -577,13 +577,16 @@ class TelnetSessionManager:
             end_output = await self._drain_output(session.reader, timeout=0.5)
             end_mode = detect_device_mode(end_output) if end_output else "unknown"
             logger.debug(f"[execute] end 后模式: {end_mode}, 输出尾部: {repr(end_output[-80:]) if end_output else 'empty'}")
+            return end_mode if end_mode != "unknown" else current_mode
         elif current_mode.endswith(">"):
             logger.info(f"[execute] 检测到用户模式 {current_mode}，自动 enable")
             session.writer.write("enable\r\n")
             await session.writer.drain()
             await asyncio.sleep(0.8)
-            await self._drain_output(session.reader, timeout=0.5)
-        return current_mode
+            enable_output = await self._drain_output(session.reader, timeout=0.5)
+            enable_mode = detect_device_mode(enable_output) if enable_output else "unknown"
+            logger.debug(f"[execute] enable 后模式：{enable_mode}, 输出尾部：{repr(enable_output[-80:]) if enable_output else 'empty'}")
+            return enable_mode if enable_mode != "unknown" else current_mode
 
     def _preprocess_command(self, command: str) -> str:
         """
@@ -621,13 +624,14 @@ class TelnetSessionManager:
         判断命令是否需要特权模式才能执行
 
         show、ping、traceroute、debug、clear 等命令需要特权模式。
+        注意：configure、interface、router、vlan 是配置命令，需要在配置模式下执行，
+        但它们的前置命令 configure terminal 需要特权模式。
         """
         cmd = command.strip().lower()
         privilege_prefixes = [
             'show', 'ping', 'traceroute', 'tracert',
             'debug', 'clear', 'reload', 'copy',
             'write', 'erase', 'delete', 'terminal',
-            'configure', 'vlan', 'interface', 'router',
             'ip ', 'no ',
         ]
         return any(cmd.startswith(prefix) for prefix in privilege_prefixes)
